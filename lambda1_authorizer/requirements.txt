@@ -1,0 +1,2 @@
+# Zero external dependencies required.
+# Pure Python standard library: hmac, hashlib, base64, json, time.
