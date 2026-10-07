@@ -203,7 +203,7 @@ def handler(event, context):
                 {"x-amz-meta-upload-mode": upload_mode},
                 {"x-amz-meta-file-hash": file_hash_val}
             ],
-            ExpiresIn=300  # 5 minutes
+            ExpiresIn=480  # 5 minutes
         )
     except ClientError as e:
         logger.error(f"Error generating presigned post: {e}")
