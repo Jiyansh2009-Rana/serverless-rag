@@ -20,6 +20,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from supabase import create_client, Client
 import base64
 import mimetypes
+from typing import Dict, Any, List
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -32,6 +33,12 @@ SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL")
 JINA_API_KEY = os.environ.get("JINA_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+AWS_REGION = os.environ.get("AWS_REGION", "ap-south-1")
+s3_client = boto3.client("s3", region_name=AWS_REGION)
+sqs_client = boto3.client("sqs", region_name=AWS_REGION)
+lambda_client = boto3.client("lambda", region_name=AWS_REGION)
+REDIS_PROXY_LAMBDA_NAME = os.environ.get("REDIS_PROXY_LAMBDA_NAME", "Redis-lambda")
+LOCAL_SESSION_TTL = int(os.environ.get("LOCAL_SESSION_TTL", "3600"))
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
@@ -357,6 +364,42 @@ def get_jina_embeddings(texts: list[str], is_image: bool = False) -> list[list[f
     data = response.json().get("data", [])
     return [item["embedding"] for item in data]
 
+def invoke_redis_proxy(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Helper to invoke Redis Proxy Lambda synchronously."""
+    try:
+        response = lambda_client.invoke(
+            FunctionName=REDIS_PROXY_LAMBDA_NAME,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload),
+        )
+        payload_bytes = response["Payload"].read()
+        res_json = json.loads(payload_bytes.decode("utf-8"))
+        if res_json.get("statusCode") != 200:
+            raise RuntimeError(f"Redis Proxy error: {res_json.get('body')}")
+        body = res_json.get("body")
+        return json.loads(body) if isinstance(body, str) else (body or {})
+    except Exception as e:
+        logger.error(f"Failed to invoke Redis proxy from Lambda 4: {e}")
+        raise
+def send_sqs_in_safe_batches(queue_url: str, chunk_batch: List[Dict[str, Any]]) -> None:
+    """Dynamically splits chunk batches into payload sizes safely below 256 KB."""
+    max_payload_bytes = 200_000
+    current_batch = []
+    current_size = 0
+
+    for item in chunk_batch:
+        item_bytes = len(json.dumps(item).encode("utf-8"))
+        if current_batch and (current_size + item_bytes > max_payload_bytes):
+            sqs_client.send_message(QueueUrl=queue_url, MessageBody=json.dumps(current_batch))
+            current_batch = [item]
+            current_size = item_bytes
+        else:
+            current_batch.append(item)
+            current_size += item_bytes
+
+    if current_batch:
+        sqs_client.send_message(QueueUrl=queue_url, MessageBody=json.dumps(current_batch))
+
 def compute_hash(text: str) -> str:
     if isinstance(text, str):
         text = text.encode("utf-8")
@@ -390,6 +433,7 @@ def handler(event, context):
         user_id = metadata.get("user-id")
         upload_mode = metadata.get("upload-mode", "global")
         file_hash_val = metadata.get("file-hash", "")
+        is_update = metadata.get("is-update", "false").lower() == "true"
 
         # Fallback extraction from key: {org_id}/{doc_id}/{filename}
         key_parts = s3_key.split("/")
@@ -425,21 +469,46 @@ def handler(event, context):
             }).eq("id", doc_id).execute()
 
         # 4. Chunk each page and prepare chunk payloads
+        # 4. Chunk each page and apply Delta (Diffing) Logic
+        # 4. Fetch existing page hashes BEFORE embedding (Global & Local)
+        existing_page_hashes = {}
+        if upload_mode == "global" and supabase and is_update:
+            try:
+                res = supabase.table("page_registry").select("page_number, page_hash").eq("document_id", doc_id).execute()
+                existing_page_hashes = {p["page_number"]: p["page_hash"] for p in res.data}
+            except Exception as e:
+                logger.error(f"Error fetching global page registry: {e}")
+
+        elif upload_mode == "local":
+            try:
+                hash_keys = [f"local:delta:{user_id}:{doc_id}:page:{p}" for p in range(1, total_pages + 1)]
+                res = invoke_redis_proxy({"action": "get_batch", "keys": hash_keys})
+                retrieved_values = res.get("values", {})
+                for p_idx in range(1, total_pages + 1):
+                    k = f"local:delta:{user_id}:{doc_id}:page:{p_idx}"
+                    if retrieved_values.get(k):
+                        existing_page_hashes[p_idx] = retrieved_values[k]
+            except Exception as e:
+                logger.error(f"Error fetching local page hashes via Redis proxy: {e}")
+
         all_chunks = []
-        page_registry_entries = []
 
         for page_idx, page_text in enumerate(pages, start=1):
             cleaned_text = page_text.strip()
             if not cleaned_text:
                 continue
 
-            page_hash_val = compute_hash(cleaned_text)
+            page_hash_val = compute_hash(file_bytes if doc_type == "image" else cleaned_text)
+
+            # DELTA CHECK BEFORE EMBEDDING: Skip unchanged pages completely
+            if existing_page_hashes.get(page_idx) == page_hash_val:
+                logger.info(f"Page {page_idx} unchanged (hash {page_hash_val}). Skipping Jina embedding.")
+                continue
+
             chunks = chunk_by_type(doc_type, cleaned_text)
-            page_chunk_ids = []
 
             for chunk_idx, chunk_text in enumerate(chunks):
                 chunk_id = f"chk_{uuid.uuid4().hex[:12]}"
-                page_chunk_ids.append(chunk_id)
                 all_chunks.append({
                     "chunk_id": chunk_id,
                     "doc_id": doc_id,
@@ -449,49 +518,37 @@ def handler(event, context):
                     "doc_type": doc_type,
                     "page_number": page_idx,
                     "chunk_index": chunk_idx,
+                    "page_hash": page_hash_val,
                     "text": chunk_text,
-                    "upload_mode": upload_mode
+                    "upload_mode": upload_mode,
+                    "file_hash": file_hash_val,
+                    "total_pages": total_pages,
+                    "s3_bucket": bucket,
+                    "s3_key": s3_key,
+                    "is_update": is_update,
+                    "stored_at": datetime.now(timezone.utc).isoformat()
                 })
 
-            page_registry_entries.append({
-                "document_id": doc_id,
-                "org_id": org_id,
-                "page_number": page_idx,
-                "page_hash": page_hash_val,
-                "chunk_count": len(chunks)
-            })
+        # 5. Generate Jina Embeddings & Dispatch to SQS Queue in Safe Batches
+        if all_chunks:
+            is_image = (doc_type == "image")
+            batch_size = 10
+            for i in range(0, len(all_chunks), batch_size):
+                chunk_batch = all_chunks[i:i + batch_size]
+                texts = [c["text"] for c in chunk_batch]
+                img_bytes_list = [file_bytes] * len(texts) if is_image else None
 
-        # Save page metadata to Supabase page_registry
-        if supabase and page_registry_entries:
-            try:
-                supabase.table("page_registry").upsert(page_registry_entries).execute()
-            except Exception as e:
-                logger.warning(f"Failed to record page_registry: {e}")
+                embeddings = get_jina_embeddings(texts, is_image=is_image, image_bytes_list=img_bytes_list)
 
-        # 5. Embed in batches and dispatch to Amazon 
-        is_image = (doc_type == "image")  
-        batch_size = 20
-        total_chunks = len(all_chunks)
-        logger.info(f"Total chunks generated: {total_chunks}")
+                for item, emb in zip(chunk_batch, embeddings):
+                    item["embedding"] = emb
 
-        for i in range(0, total_chunks, batch_size):
-            chunk_batch = all_chunks[i:i + batch_size]
-            texts = [c["text"] for c in chunk_batch]
-            
-            # Fetch embeddings from Jina AI
-            embeddings = get_jina_embeddings(texts, is_image=is_image)
-            for item, emb in zip(chunk_batch, embeddings):
-                item["embedding"] = emb
+                send_sqs_in_safe_batches(SQS_QUEUE_URL, chunk_batch)
 
-            # Send batch payload to SQS queue
-            sqs_client.send_message(
-                QueueUrl=SQS_QUEUE_URL,
-                MessageBody=json.dumps(chunk_batch)
-            )
-
-        logger.info(f"Successfully processed and queued {total_chunks} chunks for doc_id {doc_id}")
+        logger.info(f"Successfully processed {len(all_chunks)} changed/new chunks for doc_id {doc_id}")
 
     return {
         "statusCode": 200,
         "body": json.dumps({"status": "parsed_and_enqueued", "records_count": len(records)})
     }
+
