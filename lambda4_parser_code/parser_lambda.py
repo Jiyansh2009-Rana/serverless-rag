@@ -406,6 +406,26 @@ def compute_hash(text: str) -> str:
     return hashlib.md5(text).hexdigest()
 
 # ── 3. Main Lambda Handler ──
+def process_record(record):
+    bucket = record["s3"]["bucket"]["name"]
+    raw_key = record["s3"]["object"]["key"]
+    s3_key = urllib.parse.unquote_plus(raw_key)
+    return {
+        "bucket":bucket,
+        "raw_key":raw_key,
+        "s3_key":s3_key
+    }
+
+def mark_failed(record):
+    try:
+        key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+        parts = key.split("/")           # {org_id}/{doc_id}/{filename}
+        if supabase and len(parts) >= 3:
+            supabase.table("document_registry").update(
+                {"status": "failed"}
+            ).eq("id", parts[1]).execute()
+    except Exception as e:
+        logger.error(f"Could not mark document failed: {e}")
 
 def handler(event, context):
     """
@@ -419,9 +439,15 @@ def handler(event, context):
 
     records = event.get("Records", [])
     for record in records:
-        bucket = record["s3"]["bucket"]["name"]
-        raw_key = record["s3"]["object"]["key"]
-        s3_key = urllib.parse.unquote_plus(raw_key)
+        try:
+            record = process_record(record)
+            bucket=record["bucket"]
+            s3_key=record["s3_key"]
+
+        except Exception:
+            logger.exception("Record processing failed")
+            mark_failed(record)
+            raise
 
         logger.info(f"Processing object s3://{bucket}/{s3_key}")
 
@@ -476,6 +502,11 @@ def handler(event, context):
             try:
                 res = supabase.table("page_registry").select("page_number, page_hash").eq("document_id", doc_id).execute()
                 existing_page_hashes = {p["page_number"]: p["page_hash"] for p in res.data}
+                changed = list({c["page_number"] for c in all_chunks})
+                supabase.table("document_chunks").delete().eq("document_id", doc_id).in_("page_number", changed).execute()
+                supabase.table("document_chunks").delete().eq("document_id", doc_id).gt("page_number", total_pages).execute()
+                supabase.table("page_registry").delete().eq("document_id", doc_id).gt("page_number", total_pages).execute()
+                supabase.table("image_store").delete().eq("document_id", doc_id).execute()
             except Exception as e:
                 logger.error(f"Error fetching global page registry: {e}")
 
@@ -504,7 +535,7 @@ def handler(event, context):
             if existing_page_hashes.get(page_idx) == page_hash_val:
                 logger.info(f"Page {page_idx} unchanged (hash {page_hash_val}). Skipping Jina embedding.")
                 continue
-
+            
             chunks = chunk_by_type(doc_type, cleaned_text)
 
             for chunk_idx, chunk_text in enumerate(chunks):
@@ -536,9 +567,9 @@ def handler(event, context):
             for i in range(0, len(all_chunks), batch_size):
                 chunk_batch = all_chunks[i:i + batch_size]
                 texts = [c["text"] for c in chunk_batch]
-                img_bytes_list = [file_bytes] * len(texts) if is_image else None
+                
 
-                embeddings = get_jina_embeddings(texts, is_image=is_image, image_bytes_list=img_bytes_list)
+                embeddings = get_jina_embeddings(texts, is_image=is_image)
 
                 for item, emb in zip(chunk_batch, embeddings):
                     item["embedding"] = emb
@@ -546,7 +577,14 @@ def handler(event, context):
                 send_sqs_in_safe_batches(SQS_QUEUE_URL, chunk_batch)
 
         logger.info(f"Successfully processed {len(all_chunks)} changed/new chunks for doc_id {doc_id}")
-
+        if not all_chunks:
+            has_text = any(p.strip() for p in pages)
+            if upload_mode == "global" and supabase:
+                supabase.table("document_registry").update(
+                    {"status": "ready" if has_text else "failed"}
+                ).eq("id", doc_id).execute()
+            elif upload_mode == "local":
+                s3_client.delete_object(Bucket=bucket, Key=s3_key)
     return {
         "statusCode": 200,
         "body": json.dumps({"status": "parsed_and_enqueued", "records_count": len(records)})

@@ -325,6 +325,7 @@ def handler(event, context):
 
         if upload_mode == "global":
             process_global_chunks(chunk_batch)
+            supabase.table("document_registry").update({"status": "ready"}).eq("id", chunk_batch[0]["doc_id"]).execute()
         elif upload_mode == "local":
             process_local_chunks(chunk_batch)
             cleanup_local_s3_file(chunk_batch)

@@ -1,0 +1,4 @@
+supabase==2.13.0
+groq==0.18.0
+requests==2.32.3
+boto3==1.35.0
