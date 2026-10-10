@@ -56,7 +56,11 @@ def parse_cookie_token(cookie_header: str) -> str | None:
 
 def extract_token(event: dict) -> str | None:
     headers = event.get("headers", {}) or {}
-
+    for c in (event.get("cookies") or []):
+        for part in c.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "access_token" and v:
+                return v
     # Case-insensitive header check
     cookie_str = headers.get("cookie") or headers.get("Cookie") or ""
     token = parse_cookie_token(cookie_str)
@@ -111,6 +115,8 @@ def handler(event, context):
 
     try:
         payload = verify_and_decode_jwt(token, secret)
+        if payload.get("type") != "access":   # refresh tokens must not authorize API calls
+            raise ValueError("Wrong token type")
         user_id = str(payload.get("sub") or payload.get("user_id") or "")
         org_id = str(payload.get("org_id") or "")
         role = str(payload.get("role") or "User")
@@ -143,5 +149,4 @@ def handler(event, context):
             return generate_policy("anonymous", "Deny", method_arn)
         return {"isAuthorized": False}
 
-# Alias for backwards compatibility
-authorizer_handler = handler
+

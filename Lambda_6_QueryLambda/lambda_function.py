@@ -50,8 +50,7 @@ DEFAULT_SYSTEM_PROMPT = """You are an intelligent document assistant for an ente
 Answer the user's question using ONLY the context provided below.
 If the context does not contain enough information, say so clearly.
 Do not fabricate or hallucinate any information not present in the context.
-Be concise, accurate, and professional. If context does not contain enough information, state what is missing while providing helpful context from your knowledge base.
-"""
+Be concise, accurate, and professional. If the context does not contain enough information, state clearly what is missing instead of answering from outside knowledge."""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # REDIS PROXY HELPER
@@ -140,7 +139,7 @@ def retrieve_global_supabase_hybrid(
         for c in raw_chunks:
             doc_id = c.get("document_id", "")
             results.append({
-                "chunk_id": c.get("chunk_id", ""),
+                "chunk_id": c.get("chunk_id") or c.get("id", ""),
                 "document_id": doc_id,
                 "document_name": doc_names.get(doc_id, doc_id),
                 "org_id": c.get("org_id", org_id),
@@ -173,63 +172,42 @@ def retrieve_local_redis_hybrid(
     org_id: str,
     match_count: int = 10
 ) -> List[Dict[str, Any]]:
-    """Performs 70% vector + 30% keyword hybrid search over Redis session chunks."""
+    """70% vector + 30% keyword over this user's local chunks stored in Redis."""
     try:
-        # 1. Look up chunk key pattern for the user via Redis Proxy
-        # Retrieve all page chunk registries for user's documents
-        page_chunk_keys = [f"local:delta:{user_id}:*:page:{p}:chunks" for p in range(1, 30)]
-        chunk_lists_res = invoke_redis_proxy({"action": "get_batch", "keys": page_chunk_keys})
-        retrieved_map = chunk_lists_res.get("values", {})
-
-        chunk_id_keys = []
-        for cl_raw in retrieved_map.values():
-            if cl_raw:
-                try:
-                    c_ids = json.loads(cl_raw) if isinstance(cl_raw, str) else cl_raw
-                    for cid in c_ids:
-                        # Find matching doc_id from chunk ID
-                        chunk_id_keys.append(f"local:{user_id}:*:chunk:{cid}")
-                except Exception:
-                    pass
-
-        # If direct key scan is needed, fallback to reading document metadata
-        docmeta_res = invoke_redis_proxy({"action": "get", "key": f"local:docmeta:{user_id}:*"})
-        
-        # Batch fetch chunk payloads
-        chunks_res = invoke_redis_proxy({"action": "get_batch", "keys": chunk_id_keys})
-        chunk_payloads = chunks_res.get("values", {})
+        scan = invoke_redis_proxy({
+            "action": "scan_keys",
+            "pattern": f"local:{user_id}:*:chunk:*",
+            "limit": 300,
+        })
+        chunk_keys = scan.get("keys", [])
+        if not chunk_keys:
+            return []
 
         scored_chunks = []
-        for raw_val in chunk_payloads.values():
-            if not raw_val:
-                continue
-            item = json.loads(raw_val) if isinstance(raw_val, str) else raw_val
-            if item.get("org_id") != org_id:
-                continue
-
-            stored_emb = item.get("embedding", [])
-            if not stored_emb:
-                continue
-
-            # Cosine similarity (70% weight)
-            vec_score = sum(a * b for a, b in zip(query_embedding, stored_emb))
-            # Keyword match score (30% weight)
-            kw_score = compute_keyword_score(query_text, item.get("text", ""))
-
-            hybrid_score = (0.7 * vec_score) + (0.3 * kw_score)
-
-            scored_chunks.append({
-                "chunk_id": item.get("chunk_id", ""),
-                "document_id": item.get("doc_id", ""),
-                "document_name": item.get("file_name", "local_doc"),
-                "org_id": item.get("org_id", org_id),
-                "page_number": item.get("page_number", 1),
-                "chunk_index": item.get("chunk_index", 0),
-                "text": item.get("text", ""),
-                "similarity_score": float(hybrid_score),
-                "upload_mode": "local",
-            })
-
+        for i in range(0, len(chunk_keys), 50):   # keep each Lambda response far below 6 MB
+            res = invoke_redis_proxy({"action": "get_batch", "keys": chunk_keys[i:i + 50]})
+            for raw_val in res.get("values", {}).values():
+                if not raw_val:
+                    continue
+                item = json.loads(raw_val) if isinstance(raw_val, str) else raw_val
+                if item.get("org_id") != org_id or item.get("user_id") != user_id:
+                    continue
+                stored_emb = item.get("embedding", [])
+                if not stored_emb:
+                    continue
+                vec_score = sum(a * b for a, b in zip(query_embedding, stored_emb))
+                kw_score = compute_keyword_score(query_text, item.get("text", ""))
+                scored_chunks.append({
+                    "chunk_id": item.get("chunk_id", ""),
+                    "document_id": item.get("doc_id", ""),
+                    "document_name": item.get("file_name", "local_doc"),
+                    "org_id": item.get("org_id", org_id),
+                    "page_number": item.get("page_number", 1),
+                    "chunk_index": item.get("chunk_index", 0),
+                    "text": item.get("text", ""),
+                    "similarity_score": float(0.7 * vec_score + 0.3 * kw_score),
+                    "upload_mode": "local",
+                })
         scored_chunks.sort(key=lambda x: x["similarity_score"], reverse=True)
         return scored_chunks[:match_count]
     except Exception as e:
@@ -430,7 +408,15 @@ def handler(event, context):
         }
 
     # 1. Query Vectorization
-    query_embedding = get_jina_query_embedding(user_query)
+    try:
+        query_embedding = get_jina_query_embedding(user_query)
+    except Exception as e:
+        logger.error(f"Query embedding failed: {e}")
+        return {
+            "statusCode": 502,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"detail": "Embedding service unavailable. Please retry."})
+        }
 
     # 2. Hybrid Retrieval according to mode
     if upload_mode == "global":
@@ -449,6 +435,16 @@ def handler(event, context):
 
     # 3. Context Reranking with Jina Reranker v3 (Top 10 -> Top 5)
     reranked_chunks = rerank_context_chunks(user_query, retrieved_chunks, top_n=5)
+        # Nothing relevant found: answer without calling the LLM (prevents made-up answers)
+    if not reranked_chunks:
+        no_ctx_answer = "I could not find anything relevant to this question in the available documents."
+        save_chat_history(user_id, org_id, session_id, user_query, no_ctx_answer, upload_mode)
+        log_query_audit(user_id, org_id, user_query, upload_mode, 0, ip_address)
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"},
+            "body": json.dumps({"session_id": session_id, "answer": no_ctx_answer, "sources": []})
+        }
 
     # 4 & 5. Citation Management
     sources = build_sources_citation(reranked_chunks)
@@ -463,7 +459,8 @@ def handler(event, context):
 
     user_name = email.split("@")[0] if email else "user"
     lang_inst = LANGUAGE_INSTRUCTIONS.get(language, "Answer in English.")
-    base_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
+    # Only admins may override the system prompt
+    base_prompt = system_prompt if (system_prompt and role in ("Admin", "Super Admin")) else DEFAULT_SYSTEM_PROMPT    
     full_system_prompt = (
         f"{base_prompt}\n\n"
         f"User Identity: You are speaking with {user_name}.\n"
@@ -474,6 +471,12 @@ def handler(event, context):
     # Stream generation via Groq API
     models_to_try = ["llama-3.3-70b-versatile", "qwen/qwen3.6-27b"]
     llm_stream = None
+    if not groq_client:
+        return {
+            "statusCode": 503,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"detail": "LLM is not configured (GROQ_API_KEY missing)."})
+        }
     for model_name in models_to_try:
         try:
             llm_stream = groq_client.chat.completions.create(
@@ -497,10 +500,19 @@ def handler(event, context):
 
     # Synthesize LLM answer and log
     full_answer = ""
-    for chunk in llm_stream:
-        token = chunk.choices[0].delta.content
-        if token:
-            full_answer += token
+    try:
+        for chunk in llm_stream:
+            token = chunk.choices[0].delta.content
+            if token:
+                full_answer += token
+    except Exception as e:
+        logger.error(f"LLM stream interrupted: {e}")
+        if not full_answer:
+            return {
+                "statusCode": 502,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"detail": "LLM generation failed. Please retry."})
+            }
 
     # 6. Record State & Audit Logging
     save_chat_history(user_id, org_id, session_id, user_query, full_answer, upload_mode)

@@ -12,6 +12,8 @@ import jwt
 import bcrypt
 from supabase import create_client, Client
 import boto3
+import secrets
+import hmac
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -19,6 +21,8 @@ logger.setLevel(logging.INFO)
 # ── Environment Configurations ──
 lambda_client = boto3.client('lambda')
 JWT_SECRET = os.environ.get("JWT_SECRET_KEY", "your-fallback-secret-key")
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET_KEY environment variable is required")
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -55,7 +59,8 @@ def invoke_redis(payload: dict) -> dict:
 # ── Utility Functions ──
 def generate_otp(length=6) -> str:
     """Generates a numeric OTP."""
-    return "".join(random.choices(string.digits, k=length))
+    
+    return "".join(secrets.choice(string.digits) for _ in range(length))
 
 def send_otp_email(to_email: str, otp: str, purpose: str):
     """Sends OTP via standard SMTP."""
@@ -288,6 +293,8 @@ def handle_login(body: dict) -> dict:
         return build_response(401, {"detail": "Invalid email or if you new user please signup first"})
 
     user = res.data[0]
+    if not user.get("is_active", True):
+        return build_response(403, {"detail": "Account is inactive."})
     stored_hash = user.get("password_hash", "")
 
     # Verify password

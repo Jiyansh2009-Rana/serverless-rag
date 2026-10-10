@@ -405,27 +405,173 @@ def compute_hash(text: str) -> str:
         text = text.encode("utf-8")
     return hashlib.md5(text).hexdigest()
 
-# ── 3. Main Lambda Handler ──
-def process_record(record):
-    bucket = record["s3"]["bucket"]["name"]
-    raw_key = record["s3"]["object"]["key"]
-    s3_key = urllib.parse.unquote_plus(raw_key)
-    return {
-        "bucket":bucket,
-        "raw_key":raw_key,
-        "s3_key":s3_key
-    }
+def make_chunk_id(doc_id: str, page_idx: int, chunk_idx: int, seed: str) -> str:
+    """Deterministic chunk id: a retry of the same file produces the same ids (no duplicates)."""
+    raw = f"{doc_id}:{page_idx}:{chunk_idx}:{seed}".encode("utf-8")
+    return "chk_" + hashlib.md5(raw).hexdigest()[:16]
 
-def mark_failed(record):
+
+def set_registry_status(doc_id: str, status: str, **extra) -> None:
+    if not supabase:
+        return
+    supabase.table("document_registry").update({"status": status, **extra}).eq("id", doc_id).execute()
+
+
+def mark_failed(record) -> None:
+    """Best-effort: mark a global document as failed. Never raises."""
     try:
         key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
-        parts = key.split("/")           # {org_id}/{doc_id}/{filename}
-        if supabase and len(parts) >= 3:
-            supabase.table("document_registry").update(
-                {"status": "failed"}
-            ).eq("id", parts[1]).execute()
+        parts = key.split("/")  # {org_id}/{doc_id}/{filename}
+        if len(parts) >= 3:
+            set_registry_status(parts[1], "failed")
     except Exception as e:
         logger.error(f"Could not mark document failed: {e}")
+
+
+def process_record(record) -> int:
+    """Does the real work for ONE S3 record. Returns the number of chunks enqueued."""
+    bucket = record["s3"]["bucket"]["name"]
+    s3_key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+    logger.info(f"Processing object s3://{bucket}/{s3_key}")
+
+    # 1. Metadata stored on the S3 object
+    head = s3_client.head_object(Bucket=bucket, Key=s3_key)
+    metadata = head.get("Metadata", {})
+    org_id = metadata.get("org-id")
+    doc_id = metadata.get("doc-id")
+    user_id = metadata.get("user-id")
+    upload_mode = metadata.get("upload-mode", "global")
+    file_hash_val = metadata.get("file-hash", "")
+    is_update = metadata.get("is-update", "false").lower() == "true"
+
+    # Fallback extraction from key: {org_id}/{doc_id}/{filename}
+    key_parts = s3_key.split("/")
+    if len(key_parts) >= 3:
+        org_id = org_id or key_parts[0]
+        doc_id = doc_id or key_parts[1]
+        filename = key_parts[-1]
+    else:
+        filename = os.path.basename(s3_key)
+        doc_id = doc_id or f"doc_{uuid.uuid4().hex[:12]}"
+        org_id = org_id or "default_org"
+
+    # 2. Download file
+    tmp_file_path = f"/tmp/{uuid.uuid4().hex}_{filename}"
+    s3_client.download_file(bucket, s3_key, tmp_file_path)
+    try:
+        with open(tmp_file_path, "rb") as f:
+            file_bytes = f.read()
+    finally:
+        if os.path.exists(tmp_file_path):
+            os.remove(tmp_file_path)
+
+    doc_type = detect_document_type(filename)
+    pages = extract_pages(file_bytes, doc_type, filename)
+    total_pages = len(pages)
+
+    # 3. Registry status -> processing (GLOBAL only; local docs never touch the shared registry)
+    if upload_mode == "global":
+        set_registry_status(doc_id, "processing", total_pages=total_pages)
+
+    # 4. Existing page hashes (delta check happens BEFORE embedding)
+    existing_page_hashes = {}
+    if upload_mode == "global" and supabase and is_update:
+        try:
+            res = supabase.table("page_registry").select("page_number, page_hash").eq("document_id", doc_id).execute()
+            existing_page_hashes = {p["page_number"]: p["page_hash"] for p in (res.data or [])}
+        except Exception as e:
+            logger.error(f"Error fetching global page registry: {e}")
+    elif upload_mode == "local":
+        try:
+            hash_keys = [f"local:delta:{user_id}:{doc_id}:page:{p}" for p in range(1, total_pages + 1)]
+            res = invoke_redis_proxy({"action": "get_batch", "keys": hash_keys})
+            retrieved_values = res.get("values", {})
+            for p_idx in range(1, total_pages + 1):
+                k = f"local:delta:{user_id}:{doc_id}:page:{p_idx}"
+                if retrieved_values.get(k):
+                    existing_page_hashes[p_idx] = retrieved_values[k]
+        except Exception as e:
+            logger.error(f"Error fetching local page hashes via Redis proxy: {e}")
+
+    # 5. Build chunks for changed pages only
+    all_chunks = []
+    emptied_pages = []  # pages that existed before but now have no text
+    for page_idx, page_text in enumerate(pages, start=1):
+        cleaned_text = page_text.strip()
+        if not cleaned_text:
+            if page_idx in existing_page_hashes:
+                emptied_pages.append(page_idx)
+            continue
+
+        is_img = (doc_type == "image")
+        page_hash_val = compute_hash(file_bytes if is_img else cleaned_text)
+
+        if existing_page_hashes.get(page_idx) == page_hash_val:
+            logger.info(f"Page {page_idx} unchanged (hash {page_hash_val}). Skipping Jina embedding.")
+            continue
+
+        chunks = chunk_by_type(doc_type, cleaned_text)
+        for chunk_idx, chunk_text in enumerate(chunks):
+            item = {
+                "chunk_id": make_chunk_id(doc_id, page_idx, chunk_idx, page_hash_val if is_img else chunk_text),
+                "doc_id": doc_id,
+                "org_id": org_id,
+                "user_id": user_id,
+                "file_name": filename,
+                "doc_type": doc_type,
+                "page_number": page_idx,
+                "chunk_index": chunk_idx,
+                "page_hash": page_hash_val,
+                "page_chunk_count": len(chunks),
+                # Images: never put the base64 data URL in the SQS message (256 KB limit)
+                "text": f"[Image: {filename}]" if is_img else chunk_text,
+                "upload_mode": upload_mode,
+                "file_hash": file_hash_val,
+                "total_pages": total_pages,
+                "s3_bucket": bucket,
+                "s3_key": s3_key,
+                "is_update": is_update,
+                "stored_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if is_img:
+                # Jina takes raw base64; strip the "data:...;base64," prefix. Removed again before SQS.
+                item["_embed_input"] = chunk_text.split(",", 1)[1] if chunk_text.startswith("data:") else chunk_text
+            all_chunks.append(item)
+
+    # 6. GLOBAL update: remove stale rows for changed / emptied / removed pages
+    if upload_mode == "global" and supabase and is_update:
+        stale_pages = sorted({c["page_number"] for c in all_chunks} | set(emptied_pages))
+        if stale_pages:
+            supabase.table("document_chunks").delete().eq("document_id", doc_id).in_("page_number", stale_pages).execute()
+        if emptied_pages:
+            supabase.table("page_registry").delete().eq("document_id", doc_id).in_("page_number", emptied_pages).execute()
+        supabase.table("document_chunks").delete().eq("document_id", doc_id).gt("page_number", total_pages).execute()
+        supabase.table("page_registry").delete().eq("document_id", doc_id).gt("page_number", total_pages).execute()
+        if doc_type == "image" and all_chunks:
+            supabase.table("image_store").delete().eq("document_id", doc_id).execute()
+
+    # 7. Embed + dispatch to SQS
+    if all_chunks:
+        is_image = (doc_type == "image")
+        batch_size = 10
+        for i in range(0, len(all_chunks), batch_size):
+            chunk_batch = all_chunks[i:i + batch_size]
+            texts = [c.get("_embed_input") or c["text"] for c in chunk_batch]
+            embeddings = get_jina_embeddings(texts, is_image=is_image)
+            for item, emb in zip(chunk_batch, embeddings):
+                item["embedding"] = emb
+                item.pop("_embed_input", None)
+            send_sqs_in_safe_batches(SQS_QUEUE_URL, chunk_batch)
+    else:
+        # Nothing to enqueue -> Lambda 5 will never run, so finish the document here.
+        has_text = any(p.strip() for p in pages)
+        if upload_mode == "global":
+            set_registry_status(doc_id, "ready" if has_text else "failed")
+        elif upload_mode == "local":
+            s3_client.delete_object(Bucket=bucket, Key=s3_key)  # Lambda 5 cleans up only when it gets a message
+
+    logger.info(f"Processed {len(all_chunks)} changed/new chunks for doc_id {doc_id}")
+    return len(all_chunks)
 
 def handler(event, context):
     """
@@ -440,153 +586,13 @@ def handler(event, context):
     records = event.get("Records", [])
     for record in records:
         try:
-            record = process_record(record)
-            bucket=record["bucket"]
-            s3_key=record["s3_key"]
-
+            process_record(record)
         except Exception:
             logger.exception("Record processing failed")
             mark_failed(record)
-            raise
+            raise  # lets S3's async retries / alarms see the failure
 
-        logger.info(f"Processing object s3://{bucket}/{s3_key}")
-
-        # 1. Fetch metadata stored on S3 object
-        head = s3_client.head_object(Bucket=bucket, Key=s3_key)
-        metadata = head.get("Metadata", {})
-        org_id = metadata.get("org-id")
-        doc_id = metadata.get("doc-id")
-        user_id = metadata.get("user-id")
-        upload_mode = metadata.get("upload-mode", "global")
-        file_hash_val = metadata.get("file-hash", "")
-        is_update = metadata.get("is-update", "false").lower() == "true"
-
-        # Fallback extraction from key: {org_id}/{doc_id}/{filename}
-        key_parts = s3_key.split("/")
-        if len(key_parts) >= 3:
-            org_id = org_id or key_parts[0]
-            doc_id = doc_id or key_parts[1]
-            filename = key_parts[-1]
-        else:
-            filename = os.path.basename(s3_key)
-            doc_id = doc_id or f"doc_{uuid.uuid4().hex[:12]}"
-            org_id = org_id or "default_org"
-
-        # 2. Download file to Lambda /tmp
-        tmp_file_path = f"/tmp/{uuid.uuid4().hex}_{filename}"
-        s3_client.download_file(bucket, s3_key, tmp_file_path)
-
-        try:
-            with open(tmp_file_path, "rb") as f:
-                file_bytes = f.read()
-        finally:
-            if os.path.exists(tmp_file_path):
-                os.remove(tmp_file_path)
-
-        doc_type = detect_document_type(filename)
-        pages = extract_pages(file_bytes, doc_type, filename)
-        total_pages = len(pages)
-
-        # 3. Update Supabase document_registry status to 'processing'
-        if supabase:
-            supabase.table("document_registry").update({
-                "status": "processing",
-                "total_pages": total_pages
-            }).eq("id", doc_id).execute()
-
-        # 4. Chunk each page and prepare chunk payloads
-        # 4. Chunk each page and apply Delta (Diffing) Logic
-        # 4. Fetch existing page hashes BEFORE embedding (Global & Local)
-        existing_page_hashes = {}
-        if upload_mode == "global" and supabase and is_update:
-            try:
-                res = supabase.table("page_registry").select("page_number, page_hash").eq("document_id", doc_id).execute()
-                existing_page_hashes = {p["page_number"]: p["page_hash"] for p in res.data}
-                changed = list({c["page_number"] for c in all_chunks})
-                supabase.table("document_chunks").delete().eq("document_id", doc_id).in_("page_number", changed).execute()
-                supabase.table("document_chunks").delete().eq("document_id", doc_id).gt("page_number", total_pages).execute()
-                supabase.table("page_registry").delete().eq("document_id", doc_id).gt("page_number", total_pages).execute()
-                supabase.table("image_store").delete().eq("document_id", doc_id).execute()
-            except Exception as e:
-                logger.error(f"Error fetching global page registry: {e}")
-
-        elif upload_mode == "local":
-            try:
-                hash_keys = [f"local:delta:{user_id}:{doc_id}:page:{p}" for p in range(1, total_pages + 1)]
-                res = invoke_redis_proxy({"action": "get_batch", "keys": hash_keys})
-                retrieved_values = res.get("values", {})
-                for p_idx in range(1, total_pages + 1):
-                    k = f"local:delta:{user_id}:{doc_id}:page:{p_idx}"
-                    if retrieved_values.get(k):
-                        existing_page_hashes[p_idx] = retrieved_values[k]
-            except Exception as e:
-                logger.error(f"Error fetching local page hashes via Redis proxy: {e}")
-
-        all_chunks = []
-
-        for page_idx, page_text in enumerate(pages, start=1):
-            cleaned_text = page_text.strip()
-            if not cleaned_text:
-                continue
-
-            page_hash_val = compute_hash(file_bytes if doc_type == "image" else cleaned_text)
-
-            # DELTA CHECK BEFORE EMBEDDING: Skip unchanged pages completely
-            if existing_page_hashes.get(page_idx) == page_hash_val:
-                logger.info(f"Page {page_idx} unchanged (hash {page_hash_val}). Skipping Jina embedding.")
-                continue
-            
-            chunks = chunk_by_type(doc_type, cleaned_text)
-
-            for chunk_idx, chunk_text in enumerate(chunks):
-                chunk_id = f"chk_{uuid.uuid4().hex[:12]}"
-                all_chunks.append({
-                    "chunk_id": chunk_id,
-                    "doc_id": doc_id,
-                    "org_id": org_id,
-                    "user_id": user_id,
-                    "file_name": filename,
-                    "doc_type": doc_type,
-                    "page_number": page_idx,
-                    "chunk_index": chunk_idx,
-                    "page_hash": page_hash_val,
-                    "text": chunk_text,
-                    "upload_mode": upload_mode,
-                    "file_hash": file_hash_val,
-                    "total_pages": total_pages,
-                    "s3_bucket": bucket,
-                    "s3_key": s3_key,
-                    "is_update": is_update,
-                    "stored_at": datetime.now(timezone.utc).isoformat()
-                })
-
-        # 5. Generate Jina Embeddings & Dispatch to SQS Queue in Safe Batches
-        if all_chunks:
-            is_image = (doc_type == "image")
-            batch_size = 10
-            for i in range(0, len(all_chunks), batch_size):
-                chunk_batch = all_chunks[i:i + batch_size]
-                texts = [c["text"] for c in chunk_batch]
-                
-
-                embeddings = get_jina_embeddings(texts, is_image=is_image)
-
-                for item, emb in zip(chunk_batch, embeddings):
-                    item["embedding"] = emb
-
-                send_sqs_in_safe_batches(SQS_QUEUE_URL, chunk_batch)
-
-        logger.info(f"Successfully processed {len(all_chunks)} changed/new chunks for doc_id {doc_id}")
-        if not all_chunks:
-            has_text = any(p.strip() for p in pages)
-            if upload_mode == "global" and supabase:
-                supabase.table("document_registry").update(
-                    {"status": "ready" if has_text else "failed"}
-                ).eq("id", doc_id).execute()
-            elif upload_mode == "local":
-                s3_client.delete_object(Bucket=bucket, Key=s3_key)
     return {
         "statusCode": 200,
         "body": json.dumps({"status": "parsed_and_enqueued", "records_count": len(records)})
     }
-

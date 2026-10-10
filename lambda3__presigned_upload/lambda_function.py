@@ -85,15 +85,21 @@ def check_document_status(file_hash_val: str, filename: str, org_id: str) -> dic
         hash_res = supabase.table("document_registry").select("id, file_name, status").eq("file_hash", file_hash_val).eq("org_id", org_id).execute()
         if hash_res.data:
             existing = hash_res.data[0]
+            if existing.get("status") == "ready":
+                kind = "duplicate" if existing["file_name"] == filename else "alias"
+                return {"type": kind, "doc_id": existing["id"], "old_name": existing["file_name"]}
             if existing["file_name"] == filename:
-                return {"type": "duplicate", "doc_id": existing["id"], "old_name": existing["file_name"]}
-            else:
-                return {"type": "alias", "doc_id": existing["id"], "old_name": existing["file_name"]}
+            # same file, earlier upload never finished (uploading / processing / failed) -> allow retry
+                return {"type": "retry", "doc_id": existing["id"]}
 
         # 2. Check for Name Match (Changed File / Delta Update)
-        name_res = supabase.table("document_registry").select("id, file_hash, status").eq("file_name", filename).eq("org_id", org_id).execute()
+        name_res = (supabase.table("document_registry").select("id")
+                .eq("file_name", filename).eq("org_id", org_id).execute())
         if name_res.data:
             return {"type": "update", "doc_id": name_res.data[0]["id"]}
+
+    # 3. Completely new file
+        return {"type": "new", "doc_id": f"doc_{uuid.uuid4().hex[:12]}"}
 
     except Exception as e:
         logger.error(f"Error checking document status in Supabase: {e}")
@@ -232,62 +238,77 @@ def handler(event, context):
         }
 
     # 3. Check upload permissions
-    if upload_mode == "global" and not check_global_upload_permission(user_id, org_id, role):
+    if not file_hash_val:
         return {
-            "statusCode": 403,
+            "statusCode": 400,
             "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({"detail": "Global upload permission is disabled for your organization/account."})
+            "body": json.dumps({"detail": "Missing required field: file_hash"})
         }
 
-    # 4. Check for duplicate content (Delta / Registry Check)
-    if upload_mode == "global":
-        if not check_global_upload_permission(user_id, org_id, role):
-            return {
-                "statusCode": 403,
-                "headers": {"Content-Type": "application/json"},
-                "body": json.dumps({"detail": "Global upload permission disabled."})
-            }
-        is_duplicate = False
-        is_update = False
-        doc_id = f"doc_{uuid.uuid4().hex[:12]}"
-        if supabase:
-            res = supabase.table("document_registry").select("id, file_name").eq("file_hash", file_hash_val).eq("org_id", org_id).execute()
-            if res.data:
-                doc_id = res.data[0]["id"]
-                is_duplicate = True
-            else:
-                res_name = supabase.table("document_registry").select("id").eq("file_name", filename).eq("org_id", org_id).execute()
-                if res_name.data:
-                    doc_id = res_name.data[0]["id"]
-                    is_update = True
-    else:
-        local_status = resolve_local_document_status(user_id, org_id, filename, file_hash_val)
-        doc_id = local_status["doc_id"]
-        is_duplicate = local_status["is_duplicate"]
-        is_update = local_status["is_update"]
+    try:
+        if upload_mode == "global":
+            doc_status = check_document_status(file_hash_val, filename, org_id)
+            doc_id = doc_status["doc_id"]
+            is_duplicate = doc_status["type"] in ("duplicate", "alias")
+            is_update = doc_status["type"] in ("update", "retry")
+
+            if doc_status["type"] == "alias" and supabase:
+                supabase.table("audit_log").insert({
+                    "event_type": "alias_detected",
+                    "user_id": user_id,
+                    "org_id": org_id,
+                    "doc_id": doc_id,
+                    "file_name": filename,
+                    "file_hash": file_hash_val,
+                    "alias_filename": filename,
+                    "original_filename": doc_status["old_name"],
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }).execute()
+        else:
+            local_status = resolve_local_document_status(user_id, org_id, filename, file_hash_val)
+            doc_id = local_status["doc_id"]
+            is_duplicate = local_status["is_duplicate"]
+            is_update = local_status["is_update"]
+    except Exception as e:
+        logger.error(f"Document status check failed: {e}")
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"detail": "Could not verify document status. Please retry."})
+        }
+
+    # Duplicate content: nothing to upload, nothing to re-index
+    if is_duplicate:
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"},
+            "body": json.dumps({
+                "doc_id": doc_id,
+                "is_duplicate": True,
+                "is_update": False,
+                "upload_data": None,
+                "detail": "Identical document already indexed. Upload skipped."
+            })
+        }
 
     s3_key = f"{org_id}/{doc_id}/{filename}"
 
-    # 5. Pre-register / Update document in Supabase
-    if supabase and not is_duplicate:
+    # 5. Pre-register in the shared registry (GLOBAL uploads only; local docs live only in Redis)
+    if upload_mode == "global" and supabase:
         try:
-            doc_record = {
+            supabase.table("document_registry").upsert({
                 "id": doc_id,
                 "org_id": org_id,
                 "file_name": filename,
                 "file_hash": file_hash_val,
                 "uploaded_by": user_id,
                 "status": "uploading",
-                "s3_bucket": S3_BUCKET_NAME,
-                "s3_key": s3_key,
+                "total_pages": 0,          # NOT NULL column; Lambda 4 sets the real value
                 "uploaded_at": datetime.now(timezone.utc).isoformat()
-            }
-            supabase.table("document_registry").upsert(doc_record).execute()
+            }).execute()
 
-            # Record audit log for new/updated upload
-            event_type = "presigned_upload_updated" if is_update else "presigned_upload_generated"
             supabase.table("audit_log").insert({
-                "event_type": event_type,
+                "event_type": "presigned_upload_updated" if is_update else "presigned_upload_generated",
                 "user_id": user_id,
                 "org_id": org_id,
                 "doc_id": doc_id,
@@ -297,6 +318,11 @@ def handler(event, context):
             }).execute()
         except Exception as e:
             logger.error(f"Error persisting to Supabase: {e}")
+            return {
+                "statusCode": 500,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"detail": "Could not register the document. Please retry."})
+            }
 
     # 6. Generate S3 Presigned POST payload
     try:

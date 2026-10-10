@@ -124,7 +124,19 @@ def handler(event, context):
                 "statusCode": 200,
                 "body": json.dumps({"success": bool(success)})
             }
-
+                # Key scan by pattern (used by Lambda 6 for local search)
+        elif action == "scan_keys":
+            pattern = event.get("pattern") or key
+            limit = int(event.get("limit", 500))
+            found = []
+            for k in redis_client.scan_iter(match=pattern, count=200):
+                found.append(k)
+                if len(found) >= limit:
+                    break
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"keys": found})
+            }
         else:
             return {
                 "statusCode": 400,

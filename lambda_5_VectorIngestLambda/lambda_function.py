@@ -116,7 +116,8 @@ def process_global_chunks(chunks: List[Dict[str, Any]]) -> None:
                     "org_id": item["org_id"],
                     "page_number": page_num,
                     "page_hash": item.get("page_hash", ""),
-                    "chunk_count": 0
+                    "chunk_count": 0,
+                    "page_chunk_count": item.get("page_chunk_count")
                 }
             page_registry_map[page_num]["chunk_count"] += 1
 
@@ -124,17 +125,32 @@ def process_global_chunks(chunks: List[Dict[str, Any]]) -> None:
         supabase.table("document_chunks").upsert(
             document_chunks_records, on_conflict="id"
         ).execute()
-
+    
     if image_store_records:
         supabase.table("image_store").upsert(
             image_store_records, on_conflict="id"
         ).execute()
 
     if page_registry_map:
-        registry_records = list(page_registry_map.values())
-        supabase.table("page_registry").upsert(
-            registry_records, on_conflict="document_id,page_number"
-        ).execute()
+        # Save a page's hash only once ALL its chunks are stored; otherwise a failed SQS message
+        # would make the next upload skip that page and its chunks would be missing forever.
+        complete = []
+        for page_num, rec in page_registry_map.items():
+            expected = rec.pop("page_chunk_count", None)
+            if expected is None:
+                complete.append(rec)
+                continue
+            res = (
+                supabase.table("document_chunks").select("id", count="exact")
+                .eq("document_id", rec["document_id"]).eq("page_number", page_num).execute()
+            )
+            if (res.count or 0) >= expected:
+                rec["chunk_count"] = expected
+                complete.append(rec)
+        if complete:
+            supabase.table("page_registry").upsert(
+                complete, on_conflict="document_id,page_number"
+            ).execute()
 
 
 def process_local_chunks(chunks: List[Dict[str, Any]]) -> None:
