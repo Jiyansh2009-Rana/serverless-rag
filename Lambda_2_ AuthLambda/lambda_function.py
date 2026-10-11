@@ -21,11 +21,10 @@ logger.setLevel(logging.INFO)
 # ── Environment Configurations ──
 lambda_client = boto3.client('lambda')
 JWT_SECRET = os.environ.get("JWT_SECRET_KEY", "your-fallback-secret-key")
-if not JWT_SECRET:
-    raise RuntimeError("JWT_SECRET_KEY environment variable is required")
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+APP_NAME = os.environ.get("APP_NAME", "AskMyDocsAI")
 
 # Redis Configuration
 
@@ -36,6 +35,7 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
 SMTP_USER = os.environ.get("SMTP_USER", "your-email@gmail.com")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "your-app-password")
 SMTP_SENDER_EMAIL = os.environ.get("SMTP_SENDER_EMAIL", SMTP_USER)
+SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", APP_NAME)
 
 ACCESS_TOKEN_EXP_MINUTES = 15
 REFRESH_TOKEN_EXP_DAYS = 7
@@ -70,13 +70,13 @@ def send_otp_email(to_email: str, otp: str, purpose: str):
     }
     
     subject = subjects.get(purpose, "Your OTP Code")
-    text_body = f"Hi from Rag-Agent Platform. Your verification code is: {otp}\nThis code is valid for 5 minutes. Please do not share it with anyone."
+    text_body = f"Hi from AskmyDocsai Rag Platform. Your verification code is: {otp}\nThis code is valid for 5 minutes. Please do not share it with anyone."
     # 2. Modern HTML UI
     html_body = f"""
     <html>
       <body style="background-color: #f4f4f5; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 40px 20px; margin: 0;">
         <div style="max-width: 500px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; padding: 40px 30px; text-align: center; box-shadow: 0 4px 15px rgba(0,0,0,0.05);">
-          <h2 style="color: #0f766e; margin-top: 0; font-size: 26px;">Rag-Agent Platform</h2>
+          <h2 style="color: #0f766e; margin-top: 0; font-size: 26px;">AskmyDocsai Rag Platform</h2>
           <hr style="border: none; border-top: 1px solid #e4e4e7; margin: 20px 0;">
           
           <p style="font-size: 16px; color: #3f3f46; margin-top: 20px;">Hello,</p>
@@ -304,6 +304,9 @@ def handle_login(body: dict) -> dict:
     user_id = user["id"]
     org_id = user["org_id"]
     role = user.get("role", "User")
+    reason = get_org_suspension_reason(org_id, role)
+    if reason:
+        return build_response(403, {"detail": f"Your organisation '{org_id}' has been suspended. Reason: {reason}"})
 
     # Generate Access Token
     access_payload = {
@@ -398,6 +401,23 @@ def handle_logout() -> dict:
         "Path=/api/v1/auth; Max-Age=0"
     )
     return build_response(200, {"detail": "Successfully logged out."}, cookies=[clear_cookie_str])
+
+def get_org_suspension_reason(org_id: str, role: str):
+    """Returns the suspension reason if the user's org is disabled, else None. Fails open."""
+    if role == "Super Admin" or not org_id or not supabase:
+        return None
+    try:
+        res = (
+            supabase.table("organization_settings")
+            .select("is_disabled, disabled_reason")
+            .eq("org_id", org_id)
+            .execute()
+        )
+        if res.data and res.data[0].get("is_disabled"):
+            return res.data[0].get("disabled_reason") or "Please contact your Super Administrator."
+    except Exception as e:
+        logger.warning(f"Org status check failed: {e}")
+    return None
 
 # ── GET /api/v1/auth/me ──
 def handle_me(event: dict) -> dict:

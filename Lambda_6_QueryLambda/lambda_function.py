@@ -356,6 +356,14 @@ def log_query_audit(user_id: str, org_id: str, query: str, query_mode: str, sour
     except Exception as e:
         logger.error(f"Failed to record audit log: {e}")
 
+def get_client_ip(event: dict) -> str:
+    """Behind the nginx proxy, sourceIp is the EC2 server, so use the X-Forwarded-For value nginx sets."""
+    headers = event.get("headers") or {}
+    forwarded = headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return event.get("requestContext", {}).get("http", {}).get("sourceIp", "0.0.0.0")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN LAMBDA HANDLER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -398,7 +406,7 @@ def handler(event, context):
     session_id = body.get("session_id") or f"session_{uuid.uuid4().hex[:12]}"
     language = body.get("language", "English")
     system_prompt = body.get("system_prompt")
-    ip_address = event.get("requestContext", {}).get("http", {}).get("sourceIp", "0.0.0.0")
+    ip_address = get_client_ip(event)
 
     if not user_query:
         return {
