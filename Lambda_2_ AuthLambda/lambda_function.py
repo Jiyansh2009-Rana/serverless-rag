@@ -399,10 +399,55 @@ def handle_logout() -> dict:
     )
     return build_response(200, {"detail": "Successfully logged out."}, cookies=[clear_cookie_str])
 
+# ── GET /api/v1/auth/me ──
+def handle_me(event: dict) -> dict:
+    
+    authorizer = (event.get("requestContext") or {}).get("authorizer") or {}
+    ctx = authorizer.get("lambda") or authorizer.get("context") or {}
+    user_id = ctx.get("user_id")
+    if not user_id:
+        return build_response(401, {"detail": "Unauthorized: Missing authentication context"})
+    if not supabase:
+        return build_response(500, {"detail": "Supabase client not initialized"})
+
+    try:
+        res = (
+            supabase.table("users")
+            .select("id, username, email, role, org_id, allow_global_upload, created_at")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        logger.error(f"Failed to load profile: {e}")
+        return build_response(500, {"detail": "Failed to load user profile."})
+
+    if not res.data:
+        return build_response(401, {"detail": "User no longer exists."})
+
+    u = res.data[0]
+    return build_response(200, {
+        "user_id": u["id"],
+        "username": u.get("username") or (u.get("email") or "").split("@")[0],
+        "email": u["email"],
+        "role": u["role"],
+        "org_id": u.get("org_id"),
+        "allow_global_upload": bool(u.get("allow_global_upload", False)),
+        "created_at": u.get("created_at"),
+    })
 
 # ── Main Handler Routing ──
 def handler(event, context):
     raw_path = event.get("rawPath", "") or event.get("path", "")
+
+    method = (
+        (event.get("requestContext") or {}).get("http", {}).get("method")
+        or event.get("httpMethod")
+        or ""
+    ).upper()
+
+    if method == "GET" and raw_path.endswith("/me"):
+        return handle_me(event)
     
     try:
         body = json.loads(event.get("body", "{}") or "{}")

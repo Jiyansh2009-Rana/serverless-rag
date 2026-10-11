@@ -4,9 +4,47 @@ import base64
 import hmac
 import hashlib
 import time
+import urllib.request
+import urllib.parse
 
 JWT_SECRET = os.environ.get("JWT_SECRET_KEY", "")
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+ORG_STATUS_CACHE_TTL = int(os.environ.get("ORG_STATUS_CACHE_TTL", "30"))  # seconds, per warm container
+_org_status_cache: dict = {}
+
+
+def is_org_disabled(org_id: str) -> bool:
+    """
+    True if organization_settings.is_disabled is set for this org.
+    Fails OPEN on any error, same as the EC2 backend (`except Exception: pass`).
+    Uses only the standard library (urllib) so the authorizer stays dependency-free.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY or not org_id:
+        return False
+
+    now = time.time()
+    cached = _org_status_cache.get(org_id)
+    if cached and now - cached[0] < ORG_STATUS_CACHE_TTL:
+        return cached[1]
+
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/organization_settings"
+            f"?select=is_disabled&org_id=eq.{urllib.parse.quote(org_id, safe='')}&limit=1"
+        )
+        req = urllib.request.Request(
+            url,
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            rows = json.loads(resp.read().decode("utf-8"))
+        disabled = bool(rows and rows[0].get("is_disabled"))
+        _org_status_cache[org_id] = (now, disabled)
+        return disabled
+    except Exception:
+        return False
 
 def base64url_decode(input_str: str) -> bytes:
     rem = len(input_str) % 4
@@ -123,6 +161,11 @@ def handler(event, context):
         email = str(payload.get("email") or "")
 
         if not user_id or not org_id:
+            if method_arn:
+                return generate_policy("anonymous", "Deny", method_arn)
+            return {"isAuthorized": False}
+        
+        if role != "Super Admin" and is_org_disabled(org_id):
             if method_arn:
                 return generate_policy("anonymous", "Deny", method_arn)
             return {"isAuthorized": False}
